@@ -1,0 +1,563 @@
+from __future__ import annotations
+
+import torch
+from torch import is_tensor
+from torch.nn import Module
+from torch.optim import AdamW
+from torch.utils.data import Dataset, TensorDataset, DataLoader
+
+from accelerate import Accelerator
+import numpy as np
+from adam_atan2_pytorch import MuonAdamAtan2
+
+from dreamer4.dreamer4 import (
+    VideoTokenizer,
+    DynamicsWorldModel,
+    Experience,
+    combine_experiences
+)
+
+import matplotlib.pyplot as plt
+from ema_pytorch import EMA
+
+# helpers
+
+def exists(v):
+    return v is not None
+
+def default(v, d):
+    return v if exists(v) else d
+
+def cycle(dl):
+    while True:
+        for batch in dl:
+            yield batch
+
+# trainers
+import os
+import torch
+import imageio
+import matplotlib.pyplot as plt
+import numpy as np
+
+def save_sample_video(video: torch.Tensor, out_dir="samples",
+                      show=True, fps=8, scale=9):
+    # Create subfolder if needed
+
+    for i,vid in enumerate(video):
+        filename = f"sample_video_{i}.gif"
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir,filename )
+
+        # video: (B, C, T, H, W)
+        # vid = video[6]  # (C, T, H, W)
+        frames = vid.permute(1, 2, 3, 0).detach().cpu().numpy()  # (T, H, W, C)
+
+        # Normalize to [0, 255]
+        frames = (frames - frames.min()) / (frames.max() - frames.min() + 1e-8)
+        frames = (frames * 255).astype(np.uint8)
+
+        # --- Nearest neighbor upscaling by repeating pixels ---
+        # frames: (T, H, W, C)
+        frames_big = np.repeat(np.repeat(frames, scale, axis=1), scale, axis=2)  
+        # Now frames_big: (T, H*scale, W*scale, C)
+
+        # Save big GIF
+        imageio.mimsave(out_path, frames_big, fps=fps)
+        print(f"Saved enlarged video to: {out_path}")
+
+        # Show preview (first frame)
+
+
+
+
+class VideoTokenizerTrainer(Module):
+    def __init__(
+        self,
+        model: VideoTokenizer,
+        dataset: Dataset,
+        optim_klass = MuonAdamAtan2,
+        batch_size = 16,
+        learning_rate = 2e-5,
+        max_grad_norm = 1.0,
+        num_train_steps = 10,
+        weight_decay = 0,
+        accelerate_kwargs: dict = dict(),
+        optim_kwargs: dict = dict(),
+        cpu = False,
+    ):
+
+# dynamics world model
+
+class BehaviorCloneTrainer(Module):
+    def __init__(
+        self,
+        model: DynamicsWorldModel,
+        dataset: Dataset,
+        optim_klass = MuonAdamAtan2,
+        batch_size = 16,
+        learning_rate = 3e-4,
+        max_grad_norm = 1.0,
+        num_train_steps = 10_000,
+        weight_decay = 0,
+        accelerate_kwargs: dict = dict(),
+        optim_kwargs: dict = dict(),
+        cpu = False,
+    ):
+    import os
+    import torch
+    import numpy as np
+    import imageio.v2 as imageio
+    from PIL import Image, ImageDraw
+    from typing import Optional
+
+
+class DreamTrainer(Module):
+    def __init__(
+        self,
+        model: DynamicsWorldModel,
+        optim_klass = AdamW,
+        batch_size = 16,
+        generate_timesteps = 16,
+        learning_rate = 3e-4,
+        max_grad_norm = None,
+        num_train_steps = 10_000,
+        weight_decay = 0.,
+        accelerate_kwargs: dict = dict(),
+        optim_kwargs: dict = dict(),
+        cpu = False,
+        makeVideo = False,
+    ):
+        super().__init__()
+
+        self.accelerator = Accelerator(
+            cpu = cpu,
+            **accelerate_kwargs
+        )
+
+        self.model = model
+
+        optim_kwargs = dict(
+            lr = learning_rate,
+            weight_decay = weight_decay
+        )
+
+        self.policy_head_optim = AdamW(model.policy_head_parameters(), **optim_kwargs)
+        self.value_head_optim = AdamW(model.value_head_parameters(), **optim_kwargs)
+
+        self.max_grad_norm = max_grad_norm
+
+        self.num_train_steps = num_train_steps
+        self.batch_size = batch_size
+        self.generate_timesteps = generate_timesteps
+
+        self.unwrapped_model = self.model
+        self.makeVideo = makeVideo
+        (
+            self.model,
+            self.policy_head_optim,
+            self.value_head_optim,
+        ) = self.accelerator.prepare(
+            self.model,
+            self.policy_head_optim,
+            self.value_head_optim
+        )
+
+    @property
+    def device(self):
+        return self.accelerator.device
+
+    @property
+    def unwrapped_model(self):
+        return self.accelerator.unwrap_model(self.model)
+
+    def print(self, *args, **kwargs):
+        return self.accelerator.print(*args, **kwargs)
+
+    def forward(
+        self
+    ):
+
+        for i in range(self.num_train_steps):
+
+            dreams = self.unwrapped_model.generate(
+                self.generate_timesteps + 1, # plus one for bootstrap value
+                batch_size = self.batch_size,
+                return_rewards_per_frame = True,
+                return_agent_actions = True,
+                return_log_probs_and_values = True,
+                image_height = 64,
+                image_width = 64,
+            )
+            if self.makeVideo and (i % 100 == 0):
+                VidDreams = self.unwrapped_model.generate(
+                self.generate_timesteps + 1,
+                batch_size=2,
+                return_rewards_per_frame=True,
+                return_agent_actions=True,
+                return_log_probs_and_values=True,
+                return_decoded_video=True,
+                image_height=64,
+                image_width=64,
+                )
+                save_dream_video(VidDreams, filename_prefix=f"dream_step_{i}")
+
+        # image_height = None,
+        # image_width = None,
+
+            rewards = dreams.rewards  # (B, T)
+            # print average reward
+            avg_reward = rewards.mean().item()
+            self.print(f'Step {i+1}/{self.num_train_steps} | Avg Dream Reward: {avg_reward:.3f}')
+            policy_head_loss, value_head_loss = self.model.learn_from_experience(dreams)
+
+            if i % 5 == 0:
+                self.model.Align_Value_Heads()
+
+            self.print(f'policy head loss: {policy_head_loss.item():.3f} | value head loss: {value_head_loss.item():.3f}')
+
+            # update policy head
+
+            self.accelerator.backward(policy_head_loss)
+
+            if exists(self.max_grad_norm):
+                self.accelerator.clip_grad_norm_(self.model.policy_head_parameters(), self.max_grad_norm)
+
+            self.policy_head_optim.step()
+            self.policy_head_optim.zero_grad()
+
+            # update value head
+
+            self.accelerator.backward(value_head_loss)
+
+            if exists(self.max_grad_norm):
+                self.accelerator.clip_grad_norm_(self.model.value_head_parameters(), self.max_grad_norm)
+
+            self.value_head_optim.step()
+            self.value_head_optim.zero_grad()
+
+        self.print('training complete')
+
+# training from sim
+class SimTrainer(Module):
+    def __init__(
+        self,
+        model: DynamicsWorldModel,
+        optim_klass = AdamW,
+        batch_size = 16,
+        generate_timesteps = 16,
+        learning_rate = 3e-4,
+        max_grad_norm = None,
+        epochs = 2,
+        weight_decay = 0.,
+        accelerate_kwargs: dict = dict(),
+        optim_kwargs: dict = dict(),
+        cpu = False,
+    ):
+        super().__init__()
+
+        self.accelerator = Accelerator(
+            cpu = cpu,
+            **accelerate_kwargs
+        )
+
+        self.model = model
+
+        optim_kwargs = dict(
+            lr = learning_rate,
+            weight_decay = weight_decay
+        )
+
+        self.policy_head_optim = AdamW(model.policy_head_parameters(), **optim_kwargs)
+        self.value_head_optim = AdamW(model.value_head_parameters(), **optim_kwargs)
+
+        self.max_grad_norm = max_grad_norm
+
+        self.epochs = epochs
+        self.batch_size = batch_size
+
+        self.generate_timesteps = generate_timesteps
+
+        self.unwrapped_model = self.model
+
+        (
+            self.model,
+            self.policy_head_optim,
+            self.value_head_optim,
+        ) = self.accelerator.prepare(
+            self.model,
+            self.policy_head_optim,
+            self.value_head_optim
+        )
+
+    @property
+    def device(self):
+        return self.accelerator.device
+
+    @property
+    def unwrapped_model(self):
+        return self.accelerator.unwrap_model(self.model)
+
+    def print(self, *args, **kwargs):
+        return self.accelerator.print(*args, **kwargs)
+
+    def learn(
+        self,
+        experience: Experience
+    ):
+
+        step_size = experience.step_size
+        agent_index = experience.agent_index
+
+        latents = experience.latents
+        old_values = experience.values
+        rewards = experience.rewards
+
+        has_agent_embed = exists(experience.agent_embed)
+        agent_embed = experience.agent_embed
+
+        discrete_actions, continuous_actions = experience.actions
+        discrete_log_probs, continuous_log_probs = experience.log_probs
+
+        discrete_old_action_unembeds, continuous_old_action_unembeds = default(experience.old_action_unembeds, (None, None))
+
+        # handle empties
+
+        empty_tensor = torch.empty_like(rewards)
+
+        agent_embed = default(agent_embed, empty_tensor)
+
+        has_discrete = exists(discrete_actions)
+        has_continuous = exists(continuous_actions)
+
+        discrete_actions = default(discrete_actions, empty_tensor)
+        continuous_actions = default(continuous_actions, empty_tensor)
+
+        discrete_log_probs = default(discrete_log_probs, empty_tensor)
+        continuous_log_probs = default(continuous_log_probs, empty_tensor)
+
+        discrete_old_action_unembeds = default(discrete_old_action_unembeds, empty_tensor)
+        continuous_old_action_unembeds = default(discrete_old_action_unembeds, empty_tensor)
+
+        # create the dataset and dataloader
+
+        dataset = TensorDataset(
+            latents,
+            discrete_actions,
+            continuous_actions,
+            discrete_log_probs,
+            continuous_log_probs,
+            agent_embed,
+            discrete_old_action_unembeds,
+            continuous_old_action_unembeds,
+            old_values,
+            rewards
+        )
+
+        dataloader = DataLoader(dataset, batch_size = self.batch_size, shuffle = True)
+
+        for _ in range(self.epochs):
+
+            for (
+                latents,
+                discrete_actions,
+                continuous_actions,
+                discrete_log_probs,
+                continuous_log_probs,
+                agent_embed,
+                discrete_old_action_unembeds,
+                continuous_old_action_unembeds,
+                old_values,
+                rewards
+            ) in dataloader:
+
+                actions = (
+                    discrete_actions if has_discrete else None,
+                    continuous_actions if has_continuous else None
+                )
+
+                log_probs = (
+                    discrete_log_probs if has_discrete else None,
+                    continuous_log_probs if has_continuous else None
+                )
+
+                old_action_unembeds = (
+                    discrete_old_action_unembeds if has_discrete else None,
+                    continuous_old_action_unembeds if has_continuous else None
+                )
+
+                batch_experience = Experience(
+                    latents = latents,
+                    actions = actions,
+                    log_probs = log_probs,
+                    agent_embed = agent_embed if has_agent_embed else None,
+                    old_action_unembeds = old_action_unembeds,
+                    values = old_values,
+                    rewards = rewards,
+                    step_size = step_size,
+                    agent_index = agent_index
+                )
+
+                policy_head_loss, value_head_loss = self.model.learn_from_experience(batch_experience)
+
+                # all_losses = {
+                #     'policy_head_loss': policy_head_loss.item(),
+                #     'value_head_loss': value_head_loss.item(),
+                #     'model_loss': 
+                # }
+
+                self.print(f'policy head loss: {policy_head_loss.item():.3f} | value head loss: {value_head_loss.item():.3f}')
+
+                # update policy head
+
+                self.accelerator.backward(policy_head_loss)
+
+                if exists(self.max_grad_norm):
+                    self.accelerator.clip_grad_norm_(self.model.policy_head_parameters(), self.max_grad_norm)
+
+                self.policy_head_optim.step()
+                self.policy_head_optim.zero_grad()
+
+                # update value head
+
+                self.accelerator.backward(value_head_loss)
+
+                if exists(self.max_grad_norm):
+                    self.accelerator.clip_grad_norm_(self.model.value_head_parameters(), self.max_grad_norm)
+
+                self.value_head_optim.step()
+                self.value_head_optim.zero_grad()
+
+        self.print('training complete')
+
+    def forward(
+        self,
+        env,
+        num_episodes = 50000,
+        max_experiences_before_learn = 8,
+        env_is_vectorized = False
+    ):
+
+        for _ in range(num_episodes):
+
+            total_experience = 0
+            experiences = []
+
+            while total_experience < max_experiences_before_learn:
+
+                experience = self.unwrapped_model.interact_with_env(env, env_is_vectorized = env_is_vectorized)
+
+                num_experience = experience.video.shape[0]
+
+                total_experience += num_experience
+
+                experiences.append(experience)
+
+            # print(f"collected experience of shape {experiences[0].video.shape}")
+            combined_experiences = combine_experiences(experiences)
+
+
+
+            self.learn(combined_experiences)
+
+            # print the summer total reward
+            total_reward = combined_experiences.rewards.sum().item()
+            self.print(f'total reward from collected experiences: {total_reward:.3f}')
+
+            experiences.clear()
+
+        # self.print(f'Trained for {_} episodes.')
+
+    @torch.no_grad()
+    def eval_episodes(
+        self,
+        env,
+        tokenizer,
+        num_episodes: int = 3,
+        max_steps: int | None = None,
+        env_is_vectorized: bool = False,
+        max_time_to_show: int = 8,
+        show=True,
+    ):
+        """
+        Run evaluation episodes with the current policy and visualize
+        original env frames vs reconstructed frames from the tokenizer.
+
+        tokenizer is expected to have:
+        - tokenize(video) -> latents
+        - decode(latents, height, width) -> recon_video
+        """
+        self.model.eval()
+        device = self.device
+
+        eval_exp = []
+        for ep in range(num_episodes):
+            # roll out one episode using the world model's current policy
+            exp: Experience = self.unwrapped_model.interact_with_env(
+                env,
+                env_is_vectorized=env_is_vectorized,
+                max_timesteps=max_steps,
+            )
+
+            if exp.video is None:
+                self.print("Experience has no raw video; skipping episode.")
+                continue
+
+            video = exp.video  # expected (b, c, t, h, w)
+            latents = exp.latents
+
+            # move to device / shapes
+            video = video.to(device)
+            latents = latents.to(device)
+
+            # decode latents back to video
+            b, c, t, h, w = video.shape
+            recon = tokenizer.decode(latents, height=h, width=w)
+
+            # bring to cpu for plotting
+            video_cpu = video[0].cpu()   # (c, t, h, w) first batch element
+            recon_cpu = recon[0].cpu()
+
+            # print the ranges for debugging
+            # self.print(f"Episode {ep}: original video range: {video_cpu.min().item():.3f} to {video_cpu.max().item():.3f}")
+            # self.print(f"Episode {ep}: recon video range: {recon_cpu.min().item():.3f} to {recon_cpu.max().item():.3f}")
+            eval_exp.append(exp)
+            
+            if show:
+                self._plot_episode_video(
+                    video_cpu,
+                    recon_cpu,
+                    episode_idx=ep,
+                    max_time_to_show=max_time_to_show,
+                )
+        return eval_exp
+
+    @staticmethod
+    def _plot_episode_video(
+                video: torch.Tensor,      # (c, t, h, w)
+        recon: torch.Tensor,      # (c, t, h, w)
+        episode_idx: int = 0,
+        max_time_to_show: int = 8,
+    ):
+        """
+        Side-by-side visualization for one episode:
+        top row = true frames, bottom row = reconstructions.
+        """
+        c, t, h, w = video.shape
+        t_show = min(t, max_time_to_show)
+
+        fig, axes = plt.subplots(2, t_show, figsize=(3 * t_show, 6))
+
+        for i in range(t_show):
+            # original
+            axes[0, i].imshow(video[:, i].permute(1, 2, 0).clamp(0, 1))
+            axes[0, i].set_title(f"ep {episode_idx} | orig t={i}")
+            axes[0, i].axis("off")
+
+            # reconstruction
+            axes[1, i].imshow(recon[:, i].permute(1, 2, 0).clamp(0, 1))
+            axes[1, i].set_title(f"ep {episode_idx} | recon t={i}")
+            axes[1, i].axis("off")
+
+        plt.tight_layout()
+        plt.show()

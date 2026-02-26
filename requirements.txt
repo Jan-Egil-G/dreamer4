@@ -1,0 +1,12 @@
+numpy
+einops
+einx[torch]
+decord
+
+adam-atan2-pytorch
+assoc-scan
+hyper-connections
+vit-pytorch
+x-mlps-pytorch
+opencv-python-headless
+hl-gauss-pytorch
